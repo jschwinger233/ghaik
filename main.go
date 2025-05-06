@@ -38,15 +38,32 @@ func main() {
 	}
 
 	cgroupPath, err := detectCgroupPath()
-	cg, err := link.AttachCgroup(link.CgroupOptions{
-		Path:    cgroupPath,
-		Program: objs.CgroupSockCreate,
-		Attach:  ebpf.AttachCGroupInetSockCreate,
-	})
-	defer cg.Close()
-	if err != nil {
-		slog.Error("failed to attach cgroup")
+
+	for prog, attach := range map[*ebpf.Program]ebpf.AttachType{
+		objs.CgroupSockCreate:  ebpf.AttachCGroupInetSockCreate,
+		objs.CgroupSockRelease: ebpf.AttachCgroupInetSockRelease,
+		objs.CgroupConnect4:    ebpf.AttachCGroupInet4Connect,
+		objs.CgroupConnect6:    ebpf.AttachCGroupInet6Connect,
+		objs.CgroupSendmsg4:    ebpf.AttachCGroupUDP4Sendmsg,
+		objs.CgroupSendmsg6:    ebpf.AttachCGroupUDP6Sendmsg,
+	} {
+		cg, err := link.AttachCgroup(link.CgroupOptions{
+			Path:    cgroupPath,
+			Program: prog,
+			Attach:  attach,
+		})
+		defer cg.Close()
+		if err != nil {
+			slog.Error("failed to attach cgroup", err)
+		}
 	}
+
+	kprobe, err := link.Kprobe("__dev_queue_xmit", objs.KprobeSkb1, nil)
+	if err != nil {
+		slog.Error("failed to attach kprobe", err)
+	}
+	defer kprobe.Close()
+	println("tracing")
 	time.Sleep(23333 * time.Second)
 
 }
