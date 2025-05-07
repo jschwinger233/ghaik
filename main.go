@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	"github.com/jschwinger233/ghaik/bpf"
 )
@@ -40,8 +44,8 @@ func main() {
 	cgroupPath, err := detectCgroupPath()
 
 	for prog, attach := range map[*ebpf.Program]ebpf.AttachType{
-		objs.CgroupSockCreate:  ebpf.AttachCGroupInetSockCreate,
 		objs.CgroupSockRelease: ebpf.AttachCgroupInetSockRelease,
+		objs.CgroupSockCreate:  ebpf.AttachCGroupInetSockCreate,
 		objs.CgroupConnect4:    ebpf.AttachCGroupInet4Connect,
 		objs.CgroupConnect6:    ebpf.AttachCGroupInet6Connect,
 		objs.CgroupSendmsg4:    ebpf.AttachCGroupUDP4Sendmsg,
@@ -58,11 +62,53 @@ func main() {
 		}
 	}
 
-	kprobe, err := link.Kprobe("__dev_queue_xmit", objs.KprobeSkb1, nil)
+	k, err := link.Kprobe("kfree_skbmem", objs.KprobeFreeSkb, nil)
 	if err != nil {
-		slog.Error("failed to attach kprobe", err)
+		slog.Error("failed to attach kfree_skbmem", err)
+		return
 	}
-	defer kprobe.Close()
+	defer k.Close()
+
+	targets, _, err := searchAvailableTargets()
+	if err != nil {
+		slog.Error("failed to find targets", err)
+		return
+	}
+	allKaddrs := []uintptr{}
+	for _, syms := range targets {
+		for _, sym := range syms {
+			allKaddrs = append(allKaddrs, uintptr(kallsymsByName[sym].Addr))
+		}
+	}
+	krmulti, err := link.KretprobeMulti(objs.KretprobeSkb, link.KprobeMultiOptions{Addresses: allKaddrs})
+	if err != nil {
+		slog.Error("failed to attach kretprobe.multi", err)
+		return
+	}
+	defer krmulti.Close()
+
+	for prog, syms := range map[*ebpf.Program][]string{
+		objs.KprobeSkb1: targets[0],
+		objs.KprobeSkb2: targets[1],
+		objs.KprobeSkb3: targets[2],
+		objs.KprobeSkb4: targets[3],
+		objs.KprobeSkb5: targets[4],
+	} {
+		kmulti, err := link.KprobeMulti(prog, link.KprobeMultiOptions{Symbols: syms})
+		if err != nil {
+			slog.Error("failed to attach kprobe.multi", err)
+			return
+		}
+		defer kmulti.Close()
+	}
+
+	kr, err := link.Kretprobe("__alloc_skb", objs.KretprobeAllocSkb, nil)
+	if err != nil {
+		slog.Error("failed to attach __alloc_skb", err)
+		return
+	}
+	defer kr.Close()
+
 	println("tracing")
 	time.Sleep(23333 * time.Second)
 
@@ -85,4 +131,107 @@ func detectCgroupPath() (string, error) {
 	}
 
 	return "", errors.New("cgroup2 not mounted")
+}
+
+func searchAvailableTargets() (targets map[int][]string, kfreeSkbReasons map[uint64]string, err error) {
+	targets = map[int][]string{}
+
+	btfSpec, err := btf.LoadKernelSpec()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load kernel BTF: %+v\n", err)
+	}
+
+	availableFuncs, err := getAvailableFilterFunctions()
+	if err != nil {
+		log.Printf("Failed to retrieve available ftrace functions (is /sys/kernel/debug/tracing mounted?): %s", err)
+	}
+
+	ReadKallsyms()
+
+	iter := btfSpec.Iterate()
+	for iter.Next() {
+		typ := iter.Type
+		fn, ok := typ.(*btf.Func)
+		if !ok {
+			continue
+		}
+
+		if _, ok := availableFuncs[fn.Name]; !ok {
+			continue
+		}
+		if _, ok := kallsymsByName[fn.Name]; !ok {
+			continue
+		}
+
+		fnProto := fn.Type.(*btf.FuncProto)
+		for i, p := range fnProto.Params {
+			if ptr, ok := p.Type.(*btf.Pointer); ok {
+				if strct, ok := ptr.Target.(*btf.Struct); ok {
+					if strct.Name == "sk_buff" && i < 5 {
+						targets[i] = append(targets[i], fn.Name)
+						continue
+					}
+				}
+			}
+		}
+	}
+
+	return targets, kfreeSkbReasons, nil
+}
+
+func getAvailableFilterFunctions() (map[string]struct{}, error) {
+	availableFuncs := make(map[string]struct{})
+	f, err := os.Open("/sys/kernel/debug/tracing/available_filter_functions")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open: %v", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
+		availableFuncs[scanner.Text()] = struct{}{}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return availableFuncs, nil
+}
+
+type Symbol struct {
+	Type string
+	Name string
+	Addr uint64
+}
+
+var kallsyms []Symbol
+var kallsymsByName map[string]Symbol = make(map[string]Symbol)
+var kallsymsByAddr map[uint64]Symbol = make(map[uint64]Symbol)
+
+func ReadKallsyms() {
+	file, err := os.Open("/proc/kallsyms")
+	if err != nil {
+		slog.Error("failed to open /proc/kallsyms: %v", err)
+		return
+	}
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			continue
+		}
+		addr, err := strconv.ParseUint(parts[0], 16, 64)
+		if err != nil {
+			continue
+		}
+		typ, name := parts[1], parts[2]
+		kallsyms = append(kallsyms, Symbol{typ, name, addr})
+		kallsymsByName[name] = Symbol{typ, name, addr}
+		kallsymsByAddr[addr] = Symbol{typ, name, addr}
+	}
+	sort.Slice(kallsyms, func(i, j int) bool {
+		return kallsyms[i].Addr < kallsyms[j].Addr
+	})
 }

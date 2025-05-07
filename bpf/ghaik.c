@@ -281,13 +281,13 @@ cont:
 	set_meta(&ev.meta, skb, ctx);
 	set_tuple(&ev.tuple, skb);
 
-	bpf_printk("ifindex=%d netdev=%s\n", ev.meta.ifindex, ev.meta.ifname);
+	bpf_printk("skb=%llx ifindex=%d netdev=%s\n", (u64)skb, ev.meta.ifindex, ev.meta.ifname);
 	//bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
 	return 0;
 }
 
 #define KPROBE_SKB_AT(X)						\
-  SEC("kprobe/skb-" #X)							\
+  SEC("kprobe.multi/skb-" #X)							\
   int kprobe_skb_##X(struct pt_regs *ctx)				\
   {									\
     struct sk_buff *skb = (struct sk_buff *) PT_REGS_PARM##X(ctx);      \
@@ -300,7 +300,7 @@ KPROBE_SKB_AT(3)
 KPROBE_SKB_AT(4)
 KPROBE_SKB_AT(5)
 
-SEC("kretprobe/skb")
+SEC("kretprobe.multi/skb")
 int kretprobe_skb(struct pt_regs *ctx)
 {
 	u64 bp = ctx->bp;
@@ -319,6 +319,7 @@ int kretprobe_alloc_skb(struct pt_regs *ctx)
 	for (int depth=0; depth < MAX_UNWIND_DEPTH; depth++) {
 		pskb = bpf_map_lookup_elem(&bp_skb_map, &bp);
 		if (pskb && *pskb) {
+			bpf_printk("inherit %llx\n", (u64)nskb);
 			bpf_map_update_elem(&skb_from_process, &nskb, &TRUE, BPF_ANY);
 			break;
 		}
