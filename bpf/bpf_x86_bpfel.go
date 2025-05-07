@@ -65,19 +65,24 @@ type BpfProgramSpecs struct {
 	CgroupSendmsg6    *ebpf.ProgramSpec `ebpf:"cgroup_sendmsg6"`
 	CgroupSockCreate  *ebpf.ProgramSpec `ebpf:"cgroup_sock_create"`
 	CgroupSockRelease *ebpf.ProgramSpec `ebpf:"cgroup_sock_release"`
+	KprobeFreeSkb     *ebpf.ProgramSpec `ebpf:"kprobe_free_skb"`
 	KprobeSkb1        *ebpf.ProgramSpec `ebpf:"kprobe_skb_1"`
 	KprobeSkb2        *ebpf.ProgramSpec `ebpf:"kprobe_skb_2"`
 	KprobeSkb3        *ebpf.ProgramSpec `ebpf:"kprobe_skb_3"`
 	KprobeSkb4        *ebpf.ProgramSpec `ebpf:"kprobe_skb_4"`
 	KprobeSkb5        *ebpf.ProgramSpec `ebpf:"kprobe_skb_5"`
+	KretprobeAllocSkb *ebpf.ProgramSpec `ebpf:"kretprobe_alloc_skb"`
+	KretprobeSkb      *ebpf.ProgramSpec `ebpf:"kretprobe_skb"`
 }
 
 // BpfMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type BpfMapSpecs struct {
+	BpSkbMap       *ebpf.MapSpec `ebpf:"bp_skb_map"`
 	CookiePinfoMap *ebpf.MapSpec `ebpf:"cookie_pinfo_map"`
 	Events         *ebpf.MapSpec `ebpf:"events"`
+	SkbFromProcess *ebpf.MapSpec `ebpf:"skb_from_process"`
 }
 
 // BpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -107,14 +112,18 @@ func (o *BpfObjects) Close() error {
 //
 // It can be passed to LoadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type BpfMaps struct {
+	BpSkbMap       *ebpf.Map `ebpf:"bp_skb_map"`
 	CookiePinfoMap *ebpf.Map `ebpf:"cookie_pinfo_map"`
 	Events         *ebpf.Map `ebpf:"events"`
+	SkbFromProcess *ebpf.Map `ebpf:"skb_from_process"`
 }
 
 func (m *BpfMaps) Close() error {
 	return _BpfClose(
+		m.BpSkbMap,
 		m.CookiePinfoMap,
 		m.Events,
+		m.SkbFromProcess,
 	)
 }
 
@@ -135,11 +144,14 @@ type BpfPrograms struct {
 	CgroupSendmsg6    *ebpf.Program `ebpf:"cgroup_sendmsg6"`
 	CgroupSockCreate  *ebpf.Program `ebpf:"cgroup_sock_create"`
 	CgroupSockRelease *ebpf.Program `ebpf:"cgroup_sock_release"`
+	KprobeFreeSkb     *ebpf.Program `ebpf:"kprobe_free_skb"`
 	KprobeSkb1        *ebpf.Program `ebpf:"kprobe_skb_1"`
 	KprobeSkb2        *ebpf.Program `ebpf:"kprobe_skb_2"`
 	KprobeSkb3        *ebpf.Program `ebpf:"kprobe_skb_3"`
 	KprobeSkb4        *ebpf.Program `ebpf:"kprobe_skb_4"`
 	KprobeSkb5        *ebpf.Program `ebpf:"kprobe_skb_5"`
+	KretprobeAllocSkb *ebpf.Program `ebpf:"kretprobe_alloc_skb"`
+	KretprobeSkb      *ebpf.Program `ebpf:"kretprobe_skb"`
 }
 
 func (p *BpfPrograms) Close() error {
@@ -150,11 +162,14 @@ func (p *BpfPrograms) Close() error {
 		p.CgroupSendmsg6,
 		p.CgroupSockCreate,
 		p.CgroupSockRelease,
+		p.KprobeFreeSkb,
 		p.KprobeSkb1,
 		p.KprobeSkb2,
 		p.KprobeSkb3,
 		p.KprobeSkb4,
 		p.KprobeSkb5,
+		p.KretprobeAllocSkb,
+		p.KretprobeSkb,
 	)
 }
 

@@ -11,7 +11,9 @@
 #define MAX_ARG_LEN 128
 #define TASK_COMM_LEN 16
 #define IFNAMSIZ 16
+#define MAX_UNWIND_DEPTH 50
 
+const static bool TRUE = true;
 
 struct pinfo_search {
 	char *argv;
@@ -19,16 +21,30 @@ struct pinfo_search {
 };
 
 struct pinfo {
-	__u32 pid;
+	u32 pid;
 	char pname[TASK_COMM_LEN];
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __u64);
+	__type(key, u64);
 	__type(value, struct pinfo);
 	__uint(max_entries, 65535);
 } cookie_pinfo_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct sk_buff *);
+	__type(value, bool);
+	__uint(max_entries, 65535);
+} skb_from_process SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, struct sk_buff *);
+	__uint(max_entries, 65535);
+} bp_skb_map SEC(".maps");
 
 union addr {
 	u32 v4addr;
@@ -72,7 +88,7 @@ struct {
 	__uint(max_entries, 1<<29);
 } events SEC(".maps");
 
-static int __noinline find_last_slash_in_arg0(__u32 index, void *data)
+static int __noinline find_last_slash_in_arg0(u32 index, void *data)
 {
 	struct pinfo_search *srch = (struct pinfo_search *)data;
 
@@ -91,7 +107,7 @@ static int __noinline find_last_slash_in_arg0(__u32 index, void *data)
 }
 
 
-static __always_inline int set_pinfo(const __u64 cookie)
+static __always_inline int set_pinfo(const u64 cookie)
 {
 	if (bpf_map_lookup_elem(&cookie_pinfo_map, &cookie))
 		return 0;
@@ -134,7 +150,7 @@ int cgroup_sock_create(struct bpf_sock *sk)
 SEC("cgroup/sock_release")
 int cgroup_sock_release(struct bpf_sock *sk)
 {
-	__u64 cookie = bpf_get_socket_cookie(sk);
+	u64 cookie = bpf_get_socket_cookie(sk);
 	bpf_map_delete_elem(&cookie_pinfo_map, &cookie);
 	return 1;
 }
@@ -172,7 +188,6 @@ get_netns(struct sk_buff *skb)
 {
 	u32 netns = BPF_CORE_READ(skb, dev, nd_net.net, ns.inum);
 
-	// if skb->dev is not initialized, try to get ns from sk->__sk_common.skc_net.net->ns.inum
 	if (netns == 0)	{
 		struct sock *sk = BPF_CORE_READ(skb, sk);
 		if (sk != NULL)
@@ -186,7 +201,7 @@ static __always_inline void
 set_meta(struct meta *meta, struct sk_buff *skb, struct pt_regs *ctx)
 {
 	meta->pc = bpf_get_func_ip(ctx);
-	meta->skb = (__u64)skb;
+	meta->skb = (u64)skb;
 	meta->second_param = PT_REGS_PARM2(ctx);
 	meta->mark = BPF_CORE_READ(skb, mark);
 	meta->netns = get_netns(skb);
@@ -242,6 +257,12 @@ set_tuple(struct tuple *tpl, struct sk_buff *skb)
 static __always_inline int
 handle_skb(struct sk_buff *skb, struct pt_regs *ctx)
 {
+	u64 bp;
+
+	bool *from_process = bpf_map_lookup_elem(&skb_from_process, &skb);
+	if (from_process && *from_process)
+		goto cont;
+
 	u64 cookie = BPF_CORE_READ(skb, sk, __sk_common.skc_cookie.counter);
 	if (!cookie)
 		return 0;
@@ -250,11 +271,18 @@ handle_skb(struct sk_buff *skb, struct pt_regs *ctx)
 	if (!pinfo || !!bpf_strncmp((char *)&pinfo->pname, 4, "curl"))
 		return 0;
 
+	bpf_map_update_elem(&skb_from_process, &skb, &TRUE, BPF_ANY);
+
+cont:
+	bp = ctx->bp;
+	bpf_map_update_elem(&bp_skb_map, &bp, &skb, BPF_ANY);
+
 	struct event ev = {};
 	set_meta(&ev.meta, skb, ctx);
 	set_tuple(&ev.tuple, skb);
 
-	bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
+	bpf_printk("ifindex=%d netdev=%s\n", ev.meta.ifindex, ev.meta.ifname);
+	//bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
 	return 0;
 }
 
@@ -271,5 +299,48 @@ KPROBE_SKB_AT(2)
 KPROBE_SKB_AT(3)
 KPROBE_SKB_AT(4)
 KPROBE_SKB_AT(5)
+
+SEC("kretprobe/skb")
+int kretprobe_skb(struct pt_regs *ctx)
+{
+	u64 bp = ctx->bp;
+	bpf_map_delete_elem(&bp_skb_map, &bp);
+	return 0;
+}
+
+SEC("kretprobe/alloc_skb")
+int kretprobe_alloc_skb(struct pt_regs *ctx)
+{
+	u64 bp = ctx->bp;
+	struct sk_buff *nskb = (struct sk_buff *)ctx->ax;
+
+	u64 caller_bp;
+	struct sk_buff **pskb;
+	for (int depth=0; depth < MAX_UNWIND_DEPTH; depth++) {
+		pskb = bpf_map_lookup_elem(&bp_skb_map, &bp);
+		if (pskb && *pskb) {
+			bpf_map_update_elem(&skb_from_process, &nskb, &TRUE, BPF_ANY);
+			break;
+		}
+
+		if (bpf_probe_read_kernel(&caller_bp, sizeof(caller_bp), (void *)bp) < 0)
+			break;
+
+		if (!caller_bp)
+			break;
+
+		bp = caller_bp;
+	}
+
+	return 0;
+}
+
+SEC("kprobe/free_skb")
+int kprobe_free_skb(struct pt_regs *ctx)
+{
+	struct sk_buff *skb = (struct sk_buff *)PT_REGS_PARM1(ctx);
+	bpf_map_delete_elem(&skb_from_process, &skb);
+	return 0;
+}
 
 char __license[] SEC("license") = "Dual BSD/GPL";
