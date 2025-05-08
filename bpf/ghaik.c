@@ -63,6 +63,7 @@ struct meta {
 	u32 ifindex;
 	u32 pid;
 	unsigned char ifname[IFNAMSIZ];
+	unsigned char pname[32];
 } __attribute__((packed));
 
 struct tuple {
@@ -281,8 +282,8 @@ cont:
 	set_meta(&ev.meta, skb, ctx);
 	set_tuple(&ev.tuple, skb);
 
-	bpf_printk("skb=%llx ifindex=%d netdev=%s\n", (u64)skb, ev.meta.ifindex, ev.meta.ifname);
-	//bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
+	//bpf_printk("skb=%llx ifindex=%d netdev=%s\n", (u64)skb, ev.meta.ifindex, ev.meta.ifname);
+	bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
 	return 0;
 }
 

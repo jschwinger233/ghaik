@@ -12,6 +12,36 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type BpfEvent struct {
+	Meta struct {
+		Pc          uint64
+		Skb         uint64
+		SecondParam uint64
+		Mark        uint32
+		Netns       uint32
+		Ifindex     uint32
+		Pid         uint32
+		Ifname      [16]uint8
+		Pname       [32]uint8
+	}
+	Tuple struct {
+		Saddr struct {
+			V4addr uint32
+			_      [12]byte
+		}
+		Daddr struct {
+			V4addr uint32
+			_      [12]byte
+		}
+		Sport      uint16
+		Dport      uint16
+		L3Proto    uint16
+		L4Proto    uint8
+		TcpFlags   uint8
+		PayloadLen uint16
+	}
+}
+
 type BpfPinfo struct {
 	Pid   uint32
 	Pname [16]int8
