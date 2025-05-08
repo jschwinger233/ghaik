@@ -7,6 +7,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,7 +70,7 @@ func main() {
 	}
 	defer k.Close()
 
-	targets, _, err := searchAvailableTargets()
+	targets, allocSkbFuncs, _, err := searchAvailableTargets()
 	if err != nil {
 		slog.Error("failed to find targets", err)
 		return
@@ -94,7 +95,11 @@ func main() {
 		objs.KprobeSkb4: targets[3],
 		objs.KprobeSkb5: targets[4],
 	} {
-		kmulti, err := link.KprobeMulti(prog, link.KprobeMultiOptions{Symbols: syms})
+		addrs := []uintptr{}
+		for _, sym := range syms {
+			addrs = append(addrs, uintptr(kallsymsByName[sym].Addr))
+		}
+		kmulti, err := link.KprobeMulti(prog, link.KprobeMultiOptions{Addresses: addrs})
 		if err != nil {
 			slog.Error("failed to attach kprobe.multi", err)
 			return
@@ -102,12 +107,12 @@ func main() {
 		defer kmulti.Close()
 	}
 
-	kr, err := link.Kretprobe("__alloc_skb", objs.KretprobeAllocSkb, nil)
+	krs, err := link.KretprobeMulti(objs.KretprobeAllocSkb, link.KprobeMultiOptions{Symbols: allocSkbFuncs})
 	if err != nil {
 		slog.Error("failed to attach __alloc_skb", err)
 		return
 	}
-	defer kr.Close()
+	defer krs.Close()
 
 	println("tracing")
 	time.Sleep(23333 * time.Second)
@@ -133,12 +138,38 @@ func detectCgroupPath() (string, error) {
 	return "", errors.New("cgroup2 not mounted")
 }
 
-func searchAvailableTargets() (targets map[int][]string, kfreeSkbReasons map[uint64]string, err error) {
+func searchAvailableTargets() (targets map[int][]string, allocSkbFuncs []string, kfreeSkbReasons map[uint64]string, err error) {
 	targets = map[int][]string{}
 
 	btfSpec, err := btf.LoadKernelSpec()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load kernel BTF: %+v\n", err)
+		return nil, nil, nil, fmt.Errorf("failed to load kernel BTF: %+v\n", err)
+	}
+
+	files, err := os.ReadDir("/sys/kernel/btf")
+	if err != nil {
+		log.Fatalf("Failed to read directory: %s", err)
+	}
+
+	iters := map[string]*btf.TypesIterator{
+		"": btfSpec.Iterate(),
+	}
+	for _, file := range files {
+		if !file.IsDir() && file.Name() != "vmlinux" {
+			path := filepath.Join("/sys/kernel/btf", file.Name())
+
+			f, err := os.Open(path)
+			if err != nil {
+				log.Fatalf("failed to open btf")
+			}
+			defer f.Close()
+
+			modSpec, err := btf.LoadSplitSpecFromReader(f, btfSpec)
+			if err != nil {
+				log.Fatalf("failed to load spec")
+			}
+			iters[file.Name()] = modSpec.Iterate()
+		}
 	}
 
 	availableFuncs, err := getAvailableFilterFunctions()
@@ -148,35 +179,49 @@ func searchAvailableTargets() (targets map[int][]string, kfreeSkbReasons map[uin
 
 	ReadKallsyms()
 
-	iter := btfSpec.Iterate()
-	for iter.Next() {
-		typ := iter.Type
-		fn, ok := typ.(*btf.Func)
-		if !ok {
-			continue
-		}
+	for kmod, iter := range iters {
+		for iter.Next() {
+			typ := iter.Type
+			fn, ok := typ.(*btf.Func)
+			if !ok {
+				continue
+			}
 
-		if _, ok := availableFuncs[fn.Name]; !ok {
-			continue
-		}
-		if _, ok := kallsymsByName[fn.Name]; !ok {
-			continue
-		}
+			name := fn.Name
+			if kmod != "" {
+				name = fmt.Sprintf("%s [%s]", fn.Name, kmod)
+			}
+			if _, ok := availableFuncs[name]; !ok {
+				continue
+			}
+			if _, ok := kallsymsByName[name]; !ok {
+				continue
+			}
 
-		fnProto := fn.Type.(*btf.FuncProto)
-		for i, p := range fnProto.Params {
-			if ptr, ok := p.Type.(*btf.Pointer); ok {
+			fnProto := fn.Type.(*btf.FuncProto)
+			for i, p := range fnProto.Params {
+				if ptr, ok := p.Type.(*btf.Pointer); ok {
+					if strct, ok := ptr.Target.(*btf.Struct); ok {
+						if strct.Name == "sk_buff" && i < 5 {
+							targets[i] = append(targets[i], name)
+							continue
+						}
+					}
+				}
+			}
+			if ptr, ok := fnProto.Return.(*btf.Pointer); ok {
 				if strct, ok := ptr.Target.(*btf.Struct); ok {
-					if strct.Name == "sk_buff" && i < 5 {
-						targets[i] = append(targets[i], fn.Name)
+					if strct.Name == "sk_buff" {
+						allocSkbFuncs = append(allocSkbFuncs, fn.Name)
 						continue
 					}
 				}
 			}
+
 		}
 	}
 
-	return targets, kfreeSkbReasons, nil
+	return targets, allocSkbFuncs, kfreeSkbReasons, nil
 }
 
 func getAvailableFilterFunctions() (map[string]struct{}, error) {
@@ -203,6 +248,7 @@ type Symbol struct {
 	Type string
 	Name string
 	Addr uint64
+	Kmod string
 }
 
 var kallsyms []Symbol
@@ -227,9 +273,20 @@ func ReadKallsyms() {
 			continue
 		}
 		typ, name := parts[1], parts[2]
-		kallsyms = append(kallsyms, Symbol{typ, name, addr})
-		kallsymsByName[name] = Symbol{typ, name, addr}
-		kallsymsByAddr[addr] = Symbol{typ, name, addr}
+		kmod := ""
+		if len(parts) >= 4 && parts[3][0] == '[' {
+			kmod = parts[3]
+		}
+		sym := Symbol{typ, name, addr, kmod}
+		kallsyms = append(kallsyms, sym)
+		if kmod != "" {
+			name = fmt.Sprintf("%s %s", name, kmod)
+		}
+		if parts[2] == "veth_xdp_rcv_skb" {
+			println(name)
+		}
+		kallsymsByName[name] = sym
+		kallsymsByAddr[addr] = sym
 	}
 	sort.Slice(kallsyms, func(i, j int) bool {
 		return kallsyms[i].Addr < kallsyms[j].Addr

@@ -308,11 +308,16 @@ int kretprobe_skb(struct pt_regs *ctx)
 	return 0;
 }
 
-SEC("kretprobe/alloc_skb")
+SEC("kretprobe.multi/alloc_skb")
 int kretprobe_alloc_skb(struct pt_regs *ctx)
 {
 	u64 bp = ctx->bp;
 	struct sk_buff *nskb = (struct sk_buff *)ctx->ax;
+	if (!nskb)
+		return 0;
+
+	if (bpf_map_lookup_elem(&skb_from_process, &nskb))
+		return 0;
 
 	u64 caller_bp;
 	struct sk_buff **pskb;
