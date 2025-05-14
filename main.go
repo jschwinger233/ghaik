@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -25,7 +24,6 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/jschwinger233/ghaik/bpf"
-	"github.com/sirupsen/logrus"
 )
 
 var nativeEndian binary.ByteOrder
@@ -64,109 +62,59 @@ type bpfEvent struct {
 	PayloadLen  uint16
 }
 
+type Symbol struct {
+	Type string
+	Name string
+	Addr uint64
+	Kmod string
+}
+
+var (
+	kallsyms       []Symbol
+	kallsymsByName = make(map[string]Symbol)
+	kallsymsByAddr = make(map[uint64]Symbol)
+)
+
 func main() {
 	spec, err := bpf.LoadBpf()
 	if err != nil {
-		slog.Error("Failed to load BPF", "err", err)
-		return
+		log.Fatalf("Failed to load BPF: %v", err)
 	}
 
-	var opts ebpf.CollectionOptions
 	objs := bpf.BpfObjects{}
-
-	if err := spec.LoadAndAssign(&objs, &opts); err != nil {
-		var (
-			ve          *ebpf.VerifierError
-			verifierLog string
-		)
-		if errors.As(err, &ve) {
-			verifierLog = fmt.Sprintf("Verifier error: %+v\n", ve)
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
+		if ve, ok := err.(*ebpf.VerifierError); ok {
+			log.Fatalf("Verifier error: %+v", ve)
 		}
-
-		slog.Error(verifierLog, "err", err)
-		return
+		log.Fatalf("Failed to load BPF objects: %v", err)
 	}
+	defer objs.Close()
 
 	cgroupPath, err := detectCgroupPath()
-
-	for prog, attach := range map[*ebpf.Program]ebpf.AttachType{
-		objs.CgroupSockRelease: ebpf.AttachCgroupInetSockRelease,
-		objs.CgroupSockCreate:  ebpf.AttachCGroupInetSockCreate,
-		objs.CgroupConnect4:    ebpf.AttachCGroupInet4Connect,
-		objs.CgroupConnect6:    ebpf.AttachCGroupInet6Connect,
-		objs.CgroupSendmsg4:    ebpf.AttachCGroupUDP4Sendmsg,
-		objs.CgroupSendmsg6:    ebpf.AttachCGroupUDP6Sendmsg,
-	} {
-		cg, err := link.AttachCgroup(link.CgroupOptions{
-			Path:    cgroupPath,
-			Program: prog,
-			Attach:  attach,
-		})
-		defer cg.Close()
-		if err != nil {
-			slog.Error("failed to attach cgroup", err)
-		}
-	}
-
-	k, err := link.Kprobe("kfree_skbmem", objs.KprobeFreeSkb, nil)
 	if err != nil {
-		slog.Error("failed to attach kfree_skbmem", err)
-		return
+		log.Fatalf("Failed to detect cgroup path: %v", err)
 	}
-	defer k.Close()
 
-	targets, allocSkbFuncs, _, err := searchAvailableTargets()
+	// Attach cgroup programs
+	links := attachCgroupPrograms(cgroupPath, objs)
+	defer closeLinks(links)
+
+	// Attach kprobes
+	kprobeLinks, err := attachKprobes(objs)
 	if err != nil {
-		slog.Error("failed to find targets", err)
-		return
+		log.Fatalf("Failed to attach kprobes: %v", err)
 	}
-	allKaddrs := []uintptr{}
-	for _, syms := range targets {
-		for _, sym := range syms {
-			allKaddrs = append(allKaddrs, uintptr(kallsymsByName[sym].Addr))
-		}
-	}
-	krmulti, err := link.KretprobeMulti(objs.KretprobeSkb, link.KprobeMultiOptions{Addresses: allKaddrs})
-	if err != nil {
-		slog.Error("failed to attach kretprobe.multi", err)
-		return
-	}
-	defer krmulti.Close()
+	defer closeLinks(kprobeLinks)
 
-	for prog, syms := range map[*ebpf.Program][]string{
-		objs.KprobeSkb1: targets[0],
-		objs.KprobeSkb2: targets[1],
-		objs.KprobeSkb3: targets[2],
-		objs.KprobeSkb4: targets[3],
-		objs.KprobeSkb5: targets[4],
-	} {
-		addrs := []uintptr{}
-		for _, sym := range syms {
-			addrs = append(addrs, uintptr(kallsymsByName[sym].Addr))
-		}
-		kmulti, err := link.KprobeMulti(prog, link.KprobeMultiOptions{Addresses: addrs})
-		if err != nil {
-			slog.Error("failed to attach kprobe.multi", err)
-			return
-		}
-		defer kmulti.Close()
-	}
+	fmt.Println("Tracing started...")
 
-	krs, err := link.KretprobeMulti(objs.KretprobeAllocSkb, link.KprobeMultiOptions{Symbols: allocSkbFuncs})
-	if err != nil {
-		slog.Error("failed to attach __alloc_skb", err)
-		return
-	}
-	defer krs.Close()
-
-	println("tracing")
+	// Set up signal handling and ringbuffer reader
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	eventsReader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
-		slog.Error("failed to new reader", err)
-		return
+		log.Fatalf("Failed to create ringbuf reader: %v", err)
 	}
 	defer eventsReader.Close()
 
@@ -175,43 +123,7 @@ func main() {
 		eventsReader.Close()
 	}()
 
-	writer, err := os.Create("/dev/stdout")
-	if err != nil {
-		return
-	}
-
-	for {
-		rec, err := eventsReader.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				return
-			}
-			logrus.Debugf("failed to read ringbuf: %+v", err)
-			continue
-		}
-
-		var event bpfEvent
-		if err = binary.Read(bytes.NewBuffer(rec.RawSample), nativeEndian, &event); err != nil {
-			logrus.Debugf("failed to parse ringbuf event: %+v", err)
-			continue
-		}
-
-		sym := NearestSymbol(event.Pc)
-		skb_ev := event
-		fmt.Fprintf(writer, "%x mark=%x netns=%010d if=%d(%s) proc=%d(%s) ", skb_ev.Skb, skb_ev.Mark, skb_ev.Netns, skb_ev.Ifindex, TrimNull(string(skb_ev.Ifname[:])), skb_ev.Pid, TrimNull(string(skb_ev.Pname[:])))
-		if event.L3Proto == syscall.ETH_P_IP {
-			fmt.Fprintf(writer, "%s:%d > %s:%d ", net.IP(skb_ev.Saddr[:4]).String(), Ntohs(skb_ev.Sport), net.IP(skb_ev.Daddr[:4]).String(), Ntohs(skb_ev.Dport))
-		} else {
-			fmt.Fprintf(writer, "[%s]:%d > [%s]:%d ", net.IP(skb_ev.Saddr[:]).String(), Ntohs(skb_ev.Sport), net.IP(skb_ev.Daddr[:]).String(), Ntohs(skb_ev.Dport))
-		}
-		if event.L4Proto == syscall.IPPROTO_TCP {
-			fmt.Fprintf(writer, "tcp_flags=%s ", TcpFlags(skb_ev.TcpFlags))
-		}
-		fmt.Fprintf(writer, "payload_len=%d ", event.PayloadLen)
-		fmt.Fprintf(writer, "%s", sym.Name)
-		fmt.Fprintf(writer, "\n")
-	}
-
+	processEvents(eventsReader)
 }
 
 func detectCgroupPath() (string, error) {
@@ -223,7 +135,6 @@ func detectCgroupPath() (string, error) {
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		// example fields: cgroup2 /sys/fs/cgroup/unified cgroup2 rw,nosuid,nodev,noexec,relatime 0 0
 		fields := strings.Split(scanner.Text(), " ")
 		if len(fields) >= 3 && fields[2] == "cgroup2" {
 			return fields[1], nil
@@ -233,47 +144,201 @@ func detectCgroupPath() (string, error) {
 	return "", errors.New("cgroup2 not mounted")
 }
 
-func searchAvailableTargets() (targets map[int][]string, allocSkbFuncs []string, kfreeSkbReasons map[uint64]string, err error) {
-	targets = map[int][]string{}
+func attachCgroupPrograms(cgroupPath string, objs bpf.BpfObjects) []link.Link {
+	programs := map[*ebpf.Program]ebpf.AttachType{
+		objs.CgroupSockRelease: ebpf.AttachCgroupInetSockRelease,
+		objs.CgroupSockCreate:  ebpf.AttachCGroupInetSockCreate,
+		objs.CgroupConnect4:    ebpf.AttachCGroupInet4Connect,
+		objs.CgroupConnect6:    ebpf.AttachCGroupInet6Connect,
+		objs.CgroupSendmsg4:    ebpf.AttachCGroupUDP4Sendmsg,
+		objs.CgroupSendmsg6:    ebpf.AttachCGroupUDP6Sendmsg,
+	}
 
+	var links []link.Link
+	for prog, attach := range programs {
+		cg, err := link.AttachCgroup(link.CgroupOptions{
+			Path:    cgroupPath,
+			Program: prog,
+			Attach:  attach,
+		})
+		if err != nil {
+			log.Printf("Warning: failed to attach cgroup %v: %v", attach, err)
+			continue
+		}
+		links = append(links, cg)
+	}
+	return links
+}
+
+func attachKprobes(objs bpf.BpfObjects) ([]link.Link, error) {
+	var links []link.Link
+
+	// Attach kprobe for kfree_skbmem
+	k, err := link.Kprobe("kfree_skbmem", objs.KprobeFreeSkb, nil)
+	if err != nil {
+		return links, fmt.Errorf("failed to attach kfree_skbmem: %w", err)
+	}
+	links = append(links, k)
+
+	// Find and attach other kprobes
+	targets, allocSkbFuncs, err := searchAvailableTargets()
+	if err != nil {
+		return links, fmt.Errorf("failed to find targets: %w", err)
+	}
+
+	// Attach kretprobe to all addresses
+	allKaddrs := getAllAddresses(targets)
+	krmulti, err := link.KretprobeMulti(objs.KretprobeSkb, link.KprobeMultiOptions{Addresses: allKaddrs})
+	if err != nil {
+		return links, fmt.Errorf("failed to attach kretprobe.multi: %w", err)
+	}
+	links = append(links, krmulti)
+
+	// Attach kprobes for different targets
+	kprobePrograms := map[*ebpf.Program][]string{
+		objs.KprobeSkb1: targets[0],
+		objs.KprobeSkb2: targets[1],
+		objs.KprobeSkb3: targets[2],
+		objs.KprobeSkb4: targets[3],
+		objs.KprobeSkb5: targets[4],
+	}
+
+	for prog, syms := range kprobePrograms {
+		if len(syms) == 0 {
+			continue
+		}
+
+		addrs := make([]uintptr, 0, len(syms))
+		for _, sym := range syms {
+			addrs = append(addrs, uintptr(kallsymsByName[sym].Addr))
+		}
+
+		kmulti, err := link.KprobeMulti(prog, link.KprobeMultiOptions{Addresses: addrs})
+		if err != nil {
+			return links, fmt.Errorf("failed to attach kprobe.multi: %w", err)
+		}
+		links = append(links, kmulti)
+	}
+
+	// Attach kretprobe for alloc_skb functions
+	if len(allocSkbFuncs) > 0 {
+		krs, err := link.KretprobeMulti(objs.KretprobeAllocSkb, link.KprobeMultiOptions{Symbols: allocSkbFuncs})
+		if err != nil {
+			return links, fmt.Errorf("failed to attach alloc_skb: %w", err)
+		}
+		links = append(links, krs)
+	}
+
+	return links, nil
+}
+
+func getAllAddresses(targets map[int][]string) []uintptr {
+	var allKaddrs []uintptr
+	for _, syms := range targets {
+		for _, sym := range syms {
+			if ksym, ok := kallsymsByName[sym]; ok {
+				allKaddrs = append(allKaddrs, uintptr(ksym.Addr))
+			}
+		}
+	}
+	return allKaddrs
+}
+
+func processEvents(eventsReader *ringbuf.Reader) {
+	writer := os.Stdout
+
+	for {
+		rec, err := eventsReader.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			log.Printf("Failed to read ringbuf: %v", err)
+			continue
+		}
+
+		var event bpfEvent
+		if err = binary.Read(bytes.NewBuffer(rec.RawSample), nativeEndian, &event); err != nil {
+			log.Printf("Failed to parse ringbuf event: %v", err)
+			continue
+		}
+
+		formatEvent(writer, event)
+	}
+}
+
+func formatEvent(writer *os.File, event bpfEvent) {
+	sym := nearestSymbol(event.Pc)
+
+	// Format common event data
+	fmt.Fprintf(writer, "%x mark=%x netns=%010d if=%d(%s) proc=%d(%s) ",
+		event.Skb, event.Mark, event.Netns, event.Ifindex,
+		trimNull(string(event.Ifname[:])), event.Pid,
+		trimNull(string(event.Pname[:])))
+
+	// Format IP addresses based on protocol
+	if event.L3Proto == syscall.ETH_P_IP {
+		fmt.Fprintf(writer, "%s:%d > %s:%d ",
+			net.IP(event.Saddr[:4]).String(), ntohs(event.Sport),
+			net.IP(event.Daddr[:4]).String(), ntohs(event.Dport))
+	} else {
+		fmt.Fprintf(writer, "[%s]:%d > [%s]:%d ",
+			net.IP(event.Saddr[:]).String(), ntohs(event.Sport),
+			net.IP(event.Daddr[:]).String(), ntohs(event.Dport))
+	}
+
+	// Format TCP flags if applicable
+	if event.L4Proto == syscall.IPPROTO_TCP {
+		fmt.Fprintf(writer, "tcp_flags=%s ", tcpFlags(event.TcpFlags))
+	}
+
+	fmt.Fprintf(writer, "payload_len=%d %s\n", event.PayloadLen, sym.Name)
+}
+
+func searchAvailableTargets() (map[int][]string, []string, error) {
+	targets := make(map[int][]string)
+	var allocSkbFuncs []string
+
+	// Load kernel BTF spec
 	btfSpec, err := btf.LoadKernelSpec()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to load kernel BTF: %+v\n", err)
+		return nil, nil, fmt.Errorf("failed to load kernel BTF: %w", err)
 	}
 
-	files, err := os.ReadDir("/sys/kernel/btf")
-	if err != nil {
-		log.Fatalf("Failed to read directory: %s", err)
-	}
-
+	// Create a map of iterators for kernel modules
 	iters := map[string]*btf.TypesIterator{
 		"": btfSpec.Iterate(),
 	}
-	for _, file := range files {
-		if !file.IsDir() && file.Name() != "vmlinux" {
-			path := filepath.Join("/sys/kernel/btf", file.Name())
 
-			f, err := os.Open(path)
-			if err != nil {
-				log.Fatalf("failed to open btf")
-			}
-			defer f.Close()
+	// Add iterators for kernel modules
+	files, err := os.ReadDir("/sys/kernel/btf")
+	if err == nil {
+		for _, file := range files {
+			if !file.IsDir() && file.Name() != "vmlinux" {
+				path := filepath.Join("/sys/kernel/btf", file.Name())
+				f, err := os.Open(path)
+				if err != nil {
+					continue
+				}
 
-			modSpec, err := btf.LoadSplitSpecFromReader(f, btfSpec)
-			if err != nil {
-				log.Fatalf("failed to load spec")
+				modSpec, err := btf.LoadSplitSpecFromReader(f, btfSpec)
+				f.Close()
+				if err != nil {
+					continue
+				}
+
+				iters[file.Name()] = modSpec.Iterate()
 			}
-			iters[file.Name()] = modSpec.Iterate()
 		}
 	}
 
-	availableFuncs, err := getAvailableFilterFunctions()
-	if err != nil {
-		log.Printf("Failed to retrieve available ftrace functions (is /sys/kernel/debug/tracing mounted?): %s", err)
-	}
+	// Get available filter functions
+	availableFuncs, _ := getAvailableFilterFunctions()
 
-	ReadKallsyms()
+	// Load kallsyms
+	readKallsyms()
 
+	// Find functions with sk_buff parameters or return values
 	for kmod, iter := range iters {
 		for iter.Next() {
 			typ := iter.Type
@@ -286,6 +351,8 @@ func searchAvailableTargets() (targets map[int][]string, allocSkbFuncs []string,
 			if kmod != "" {
 				name = fmt.Sprintf("%s [%s]", fn.Name, kmod)
 			}
+
+			// Skip functions that aren't available for tracing
 			if _, ok := availableFuncs[name]; !ok {
 				continue
 			}
@@ -294,68 +361,57 @@ func searchAvailableTargets() (targets map[int][]string, allocSkbFuncs []string,
 			}
 
 			fnProto := fn.Type.(*btf.FuncProto)
+
+			// Check function parameters for sk_buff
 			for i, p := range fnProto.Params {
 				if ptr, ok := p.Type.(*btf.Pointer); ok {
 					if strct, ok := ptr.Target.(*btf.Struct); ok {
 						if strct.Name == "sk_buff" && i < 5 {
 							targets[i] = append(targets[i], name)
-							continue
+							break
 						}
 					}
 				}
 			}
+
+			// Check return value for sk_buff
 			if ptr, ok := fnProto.Return.(*btf.Pointer); ok {
 				if strct, ok := ptr.Target.(*btf.Struct); ok {
 					if strct.Name == "sk_buff" {
 						allocSkbFuncs = append(allocSkbFuncs, fn.Name)
-						continue
 					}
 				}
 			}
-
 		}
 	}
 
-	return targets, allocSkbFuncs, kfreeSkbReasons, nil
+	return targets, allocSkbFuncs, nil
 }
 
 func getAvailableFilterFunctions() (map[string]struct{}, error) {
 	availableFuncs := make(map[string]struct{})
 	f, err := os.Open("/sys/kernel/debug/tracing/available_filter_functions")
 	if err != nil {
-		return nil, fmt.Errorf("failed to open: %v", err)
+		return availableFuncs, err
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Split(bufio.ScanLines)
 	for scanner.Scan() {
 		availableFuncs[scanner.Text()] = struct{}{}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
 
-	return availableFuncs, nil
+	return availableFuncs, scanner.Err()
 }
 
-type Symbol struct {
-	Type string
-	Name string
-	Addr uint64
-	Kmod string
-}
-
-var kallsyms []Symbol
-var kallsymsByName map[string]Symbol = make(map[string]Symbol)
-var kallsymsByAddr map[uint64]Symbol = make(map[uint64]Symbol)
-
-func ReadKallsyms() {
+func readKallsyms() {
 	file, err := os.Open("/proc/kallsyms")
 	if err != nil {
-		slog.Error("failed to open /proc/kallsyms: %v", err)
+		log.Printf("Failed to open /proc/kallsyms: %v", err)
 		return
 	}
+	defer file.Close()
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -363,30 +419,39 @@ func ReadKallsyms() {
 		if len(parts) < 3 {
 			continue
 		}
+
 		addr, err := strconv.ParseUint(parts[0], 16, 64)
 		if err != nil {
 			continue
 		}
+
 		typ, name := parts[1], parts[2]
 		kmod := ""
 		if len(parts) >= 4 && parts[3][0] == '[' {
 			kmod = parts[3]
 		}
+
 		sym := Symbol{typ, name, addr, kmod}
 		kallsyms = append(kallsyms, sym)
+
+		fullName := name
 		if kmod != "" {
-			name = fmt.Sprintf("%s %s", name, kmod)
+			fullName = fmt.Sprintf("%s %s", name, kmod)
 		}
-		kallsymsByName[name] = sym
+		kallsymsByName[fullName] = sym
 		kallsymsByAddr[addr] = sym
 	}
+
 	sort.Slice(kallsyms, func(i, j int) bool {
 		return kallsyms[i].Addr < kallsyms[j].Addr
 	})
 }
 
-func NearestSymbol(addr uint64) Symbol {
-	idx, _ := slices.BinarySearchFunc(kallsyms, addr, func(x Symbol, addr uint64) int { return int(x.Addr - addr) })
+func nearestSymbol(addr uint64) Symbol {
+	idx, _ := slices.BinarySearchFunc(kallsyms, addr, func(x Symbol, addr uint64) int {
+		return int(x.Addr - addr)
+	})
+
 	if idx == len(kallsyms) {
 		return kallsyms[idx-1]
 	}
@@ -399,41 +464,38 @@ func NearestSymbol(addr uint64) Symbol {
 	return kallsyms[idx-1]
 }
 
-func Htons(x uint16) uint16 {
-	data := make([]byte, 2)
-	nativeEndian.PutUint16(data, x)
-	return binary.BigEndian.Uint16(data)
+func closeLinks(links []link.Link) {
+	for _, l := range links {
+		l.Close()
+	}
 }
 
-func Ntohs(x uint16) uint16 {
+func ntohs(x uint16) uint16 {
 	data := make([]byte, 2)
 	binary.BigEndian.PutUint16(data, x)
 	return nativeEndian.Uint16(data)
 }
 
-func TrimNull(s string) string {
+func trimNull(s string) string {
 	return strings.TrimRight(s, "\x00")
 }
 
-func TcpFlags(data uint8) string {
-	flags := []string{}
-	if data&0b00100000 != 0 {
-		flags = append(flags, "U")
+func tcpFlags(data uint8) string {
+	var flags []string
+	flagMap := map[uint8]string{
+		0b00100000: "U",
+		0b00010000: ".",
+		0b00001000: "P",
+		0b00000100: "R",
+		0b00000010: "S",
+		0b00000001: "F",
 	}
-	if data&0b00010000 != 0 {
-		flags = append(flags, ".")
+
+	for bit, flag := range flagMap {
+		if data&bit != 0 {
+			flags = append(flags, flag)
+		}
 	}
-	if data&0b00001000 != 0 {
-		flags = append(flags, "P")
-	}
-	if data&0b00000100 != 0 {
-		flags = append(flags, "R")
-	}
-	if data&0b00000010 != 0 {
-		flags = append(flags, "S")
-	}
-	if data&0b00000001 != 0 {
-		flags = append(flags, "F")
-	}
+
 	return strings.Join(flags, "")
 }
