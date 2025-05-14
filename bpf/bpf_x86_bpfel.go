@@ -12,6 +12,11 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type BpfConfig struct {
+	Pname [16]uint8
+	Plen  uint32
+}
+
 type BpfEvent struct {
 	Meta struct {
 		Pc          uint64
@@ -119,6 +124,7 @@ type BpfMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type BpfVariableSpecs struct {
+	CONFIG             *ebpf.VariableSpec `ebpf:"CONFIG"`
 	*ebpf.VariableSpec `ebpf:"_"`
 }
 
@@ -161,6 +167,7 @@ func (m *BpfMaps) Close() error {
 //
 // It can be passed to LoadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type BpfVariables struct {
+	CONFIG         *ebpf.Variable `ebpf:"CONFIG"`
 	*ebpf.Variable `ebpf:"_"`
 }
 

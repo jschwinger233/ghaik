@@ -15,6 +15,13 @@
 
 const static bool TRUE = true;
 
+struct config {
+	u8 pname[TASK_COMM_LEN];
+	u32 plen;
+};
+
+volatile const struct config CONFIG = {};
+
 struct pinfo_search {
 	char *argv;
 	u8 idx_comm;
@@ -269,7 +276,7 @@ handle_skb(struct sk_buff *skb, struct pt_regs *ctx)
 		return 0;
 
 	struct pinfo *pinfo = bpf_map_lookup_elem(&cookie_pinfo_map, &cookie);
-	if (!pinfo || !!bpf_strncmp((char *)&pinfo->pname, 4, "curl"))
+	if (!pinfo || !!bpf_strncmp((char *)&pinfo->pname, CONFIG.plen, (char *)&CONFIG.pname))
 		return 0;
 
 	bpf_map_update_elem(&skb_from_process, &skb, &TRUE, BPF_ANY);
@@ -282,7 +289,6 @@ cont:
 	set_meta(&ev.meta, skb, ctx);
 	set_tuple(&ev.tuple, skb);
 
-	//bpf_printk("skb=%llx ifindex=%d netdev=%s\n", (u64)skb, ev.meta.ifindex, ev.meta.ifname);
 	bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
 	return 0;
 }
@@ -325,7 +331,6 @@ int kretprobe_alloc_skb(struct pt_regs *ctx)
 	for (int depth=0; depth < MAX_UNWIND_DEPTH; depth++) {
 		pskb = bpf_map_lookup_elem(&bp_skb_map, &bp);
 		if (pskb && *pskb) {
-			bpf_printk("inherit %llx\n", (u64)nskb);
 			bpf_map_update_elem(&skb_from_process, &nskb, &TRUE, BPF_ANY);
 			break;
 		}

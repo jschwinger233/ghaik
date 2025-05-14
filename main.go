@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -69,6 +70,13 @@ type Symbol struct {
 	Kmod string
 }
 
+// Types that match the constants in the BPF program
+// This matches the 'struct config' in the BPF program
+type BpfConfig struct {
+	Pname [16]byte
+	Plen  uint32
+}
+
 var (
 	kallsyms       []Symbol
 	kallsymsByName = make(map[string]Symbol)
@@ -76,16 +84,55 @@ var (
 )
 
 func main() {
-	if err := run(); err != nil {
+	var filterProcessName string
+	flag.StringVar(&filterProcessName, "process", "", "Process name to filter (up to 16 characters)")
+	flag.Parse()
+
+	if filterProcessName == "" {
+		fmt.Println("No process name provided. Use -process flag to specify a process name.")
+		os.Exit(1)
+	}
+	if err := run(filterProcessName); err != nil {
 		log.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(processName string) error {
 	spec, err := bpf.LoadBpf()
 	if err != nil {
 		return fmt.Errorf("failed to load BPF: %w", err)
+	}
+
+	// Pass the process filter to the BPF program if provided
+	if processName != "" {
+		for varName, varSpec := range spec.Variables {
+			println("Variable name:", varName, "Variable spec:", varSpec)
+		}
+		configVar, ok := spec.Variables["CONFIG"]
+		if !ok {
+			return fmt.Errorf("'CONFIG' variable not found in BPF program")
+		}
+
+		// Create and populate the configuration structure
+		config := BpfConfig{}
+
+		// Copy process name to the Pname field, ensuring we don't exceed the array size
+		copy(config.Pname[:], processName)
+
+		// Set the length of the process name
+		nameLen := len(processName)
+		if nameLen > len(config.Pname) {
+			nameLen = len(config.Pname)
+		}
+		config.Plen = uint32(nameLen)
+
+		// Set the variable in the BPF program
+		if err := configVar.Set(config); err != nil {
+			return fmt.Errorf("failed to set process filter: %w", err)
+		}
+
+		log.Printf("Process filter set to: %s (length: %d)", processName, config.Plen)
 	}
 
 	objs := bpf.BpfObjects{}
