@@ -76,23 +76,30 @@ var (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("Error: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	spec, err := bpf.LoadBpf()
 	if err != nil {
-		log.Fatalf("Failed to load BPF: %v", err)
+		return fmt.Errorf("failed to load BPF: %w", err)
 	}
 
 	objs := bpf.BpfObjects{}
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		if ve, ok := err.(*ebpf.VerifierError); ok {
-			log.Fatalf("Verifier error: %+v", ve)
+			return fmt.Errorf("verifier error: %+v", ve)
 		}
-		log.Fatalf("Failed to load BPF objects: %v", err)
+		return fmt.Errorf("failed to load BPF objects: %w", err)
 	}
 	defer objs.Close()
 
 	cgroupPath, err := detectCgroupPath()
 	if err != nil {
-		log.Fatalf("Failed to detect cgroup path: %v", err)
+		return fmt.Errorf("failed to detect cgroup path: %w", err)
 	}
 
 	// Attach cgroup programs
@@ -102,7 +109,7 @@ func main() {
 	// Attach kprobes
 	kprobeLinks, err := attachKprobes(objs)
 	if err != nil {
-		log.Fatalf("Failed to attach kprobes: %v", err)
+		return fmt.Errorf("failed to attach kprobes: %w", err)
 	}
 	defer closeLinks(kprobeLinks)
 
@@ -114,7 +121,7 @@ func main() {
 
 	eventsReader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
-		log.Fatalf("Failed to create ringbuf reader: %v", err)
+		return fmt.Errorf("failed to create ringbuf reader: %w", err)
 	}
 	defer eventsReader.Close()
 
@@ -123,7 +130,11 @@ func main() {
 		eventsReader.Close()
 	}()
 
-	processEvents(eventsReader)
+	if err := processEvents(eventsReader); err != nil {
+		return fmt.Errorf("error processing events: %w", err)
+	}
+
+	return nil
 }
 
 func detectCgroupPath() (string, error) {
@@ -244,15 +255,17 @@ func getAllAddresses(targets map[int][]string) []uintptr {
 	return allKaddrs
 }
 
-func processEvents(eventsReader *ringbuf.Reader) {
+func processEvents(eventsReader *ringbuf.Reader) error {
 	writer := os.Stdout
 
 	for {
 		rec, err := eventsReader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				return
+				// This is expected on graceful shutdown
+				return nil
 			}
+			// Just log the error and continue processing other events
 			log.Printf("Failed to read ringbuf: %v", err)
 			continue
 		}
@@ -336,7 +349,9 @@ func searchAvailableTargets() (map[int][]string, []string, error) {
 	availableFuncs, _ := getAvailableFilterFunctions()
 
 	// Load kallsyms
-	readKallsyms()
+	if err := readKallsyms(); err != nil {
+		return nil, nil, fmt.Errorf("failed to read kallsyms: %w", err)
+	}
 
 	// Find functions with sk_buff parameters or return values
 	for kmod, iter := range iters {
@@ -404,11 +419,10 @@ func getAvailableFilterFunctions() (map[string]struct{}, error) {
 	return availableFuncs, scanner.Err()
 }
 
-func readKallsyms() {
+func readKallsyms() error {
 	file, err := os.Open("/proc/kallsyms")
 	if err != nil {
-		log.Printf("Failed to open /proc/kallsyms: %v", err)
-		return
+		return fmt.Errorf("failed to open /proc/kallsyms: %w", err)
 	}
 	defer file.Close()
 
@@ -442,9 +456,15 @@ func readKallsyms() {
 		kallsymsByAddr[addr] = sym
 	}
 
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading kallsyms: %w", err)
+	}
+
 	sort.Slice(kallsyms, func(i, j int) bool {
 		return kallsyms[i].Addr < kallsyms[j].Addr
 	})
+
+	return nil
 }
 
 func nearestSymbol(addr uint64) Symbol {
