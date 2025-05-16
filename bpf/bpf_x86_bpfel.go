@@ -25,9 +25,7 @@ type BpfEvent struct {
 		Mark        uint32
 		Netns       uint32
 		Ifindex     uint32
-		Pid         uint32
 		Ifname      [16]uint8
-		Pname       [32]uint8
 	}
 	Tuple struct {
 		Saddr struct {

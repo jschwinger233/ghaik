@@ -68,9 +68,7 @@ struct meta {
 	u32 mark;
 	u32 netns;
 	u32 ifindex;
-	u32 pid;
 	unsigned char ifname[IFNAMSIZ];
-	unsigned char pname[32];
 } __attribute__((packed));
 
 struct tuple {

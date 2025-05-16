@@ -50,9 +50,7 @@ type bpfEvent struct {
 	Mark        uint32
 	Netns       uint32
 	Ifindex     uint32
-	Pid         uint32
 	Ifname      [16]uint8
-	Pname       [32]uint8
 	Saddr       [16]byte
 	Daddr       [16]byte
 	Sport       uint16
@@ -188,8 +186,8 @@ func run(processName string) error {
 }
 
 func printColumnHeaders() {
-	fmt.Printf("%-16s %-10s %-12s %-20s %-18s %-45s %-10s %-7s %s\n",
-		"SKB", "MARK", "NETNS", "INTERFACE", "PROCESS", "CONNECTION", "FLAGS", "LENGTH", "FUNCTION")
+	fmt.Printf("%-16s %-10s %-12s %-20s %-45s %-10s %-7s %s\n",
+		"SKB", "MARK", "NETNS", "INTERFACE", "CONNECTION", "FLAGS", "LENGTH", "FUNCTION")
 	fmt.Printf("%s\n", strings.Repeat("-", 150)) // Separator line
 }
 
@@ -342,9 +340,6 @@ func formatEvent(writer *os.File, event bpfEvent) {
 	// Format interface info
 	ifInfo := fmt.Sprintf("%d(%s)", event.Ifindex, trimNull(string(event.Ifname[:])))
 
-	// Format process info
-	procInfo := fmt.Sprintf("%d(%s)", event.Pid, trimNull(string(event.Pname[:])))
-
 	// Format connection info based on protocol
 	var connInfo string
 	if event.L3Proto == syscall.ETH_P_IP {
@@ -364,12 +359,11 @@ func formatEvent(writer *os.File, event bpfEvent) {
 	}
 
 	// Format and print the event with column alignment
-	fmt.Fprintf(writer, "%-16x %-10x %-12d %-20s %-18s %-45s %-10s %-7d %s\n",
+	fmt.Fprintf(writer, "%-16x %-10x %-12d %-20s %-45s %-10s %-7d %s\n",
 		event.Skb,        // SKB address - 16 chars for 64-bit hex
 		event.Mark,       // Mark - 10 chars for 32-bit hex
 		event.Netns,      // Network namespace - 12 chars for up to 10-digit number
 		ifInfo,           // Interface info - 20 chars for index and name
-		procInfo,         // Process info - 18 chars for pid and name
 		connInfo,         // Connection info - 45 chars for source and destination
 		tcpFlagsStr,      // TCP flags - 10 chars
 		event.PayloadLen, // Payload length - 7 chars
@@ -586,5 +580,6 @@ func tcpFlags(data uint8) string {
 		}
 	}
 
+	sort.Strings(flags)
 	return strings.Join(flags, "")
 }
