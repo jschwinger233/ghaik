@@ -85,11 +85,11 @@ var (
 
 func main() {
 	var filterProcessName string
-	flag.StringVar(&filterProcessName, "process", "", "Process name to filter (up to 16 characters)")
+	flag.StringVar(&filterProcessName, "p", "", "Process name to filter (up to 16 characters)")
 	flag.Parse()
 
 	if filterProcessName == "" {
-		fmt.Println("No process name provided. Use -process flag to specify a process name.")
+		fmt.Println("No process name provided. Use -p flag to specify a process name.")
 		os.Exit(1)
 	}
 	if err := run(filterProcessName); err != nil {
@@ -162,6 +162,9 @@ func run(processName string) error {
 
 	fmt.Println("Tracing started...")
 
+	// Print header row for formatted output
+	printColumnHeaders()
+
 	// Set up signal handling and ringbuffer reader
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -182,6 +185,12 @@ func run(processName string) error {
 	}
 
 	return nil
+}
+
+func printColumnHeaders() {
+	fmt.Printf("%-16s %-10s %-12s %-20s %-18s %-45s %-10s %-7s %s\n",
+		"SKB", "MARK", "NETNS", "INTERFACE", "PROCESS", "CONNECTION", "FLAGS", "LENGTH", "FUNCTION")
+	fmt.Printf("%s\n", strings.Repeat("-", 150)) // Separator line
 }
 
 func detectCgroupPath() (string, error) {
@@ -330,29 +339,42 @@ func processEvents(eventsReader *ringbuf.Reader) error {
 func formatEvent(writer *os.File, event bpfEvent) {
 	sym := nearestSymbol(event.Pc)
 
-	// Format common event data
-	fmt.Fprintf(writer, "%x mark=%x netns=%010d if=%d(%s) proc=%d(%s) ",
-		event.Skb, event.Mark, event.Netns, event.Ifindex,
-		trimNull(string(event.Ifname[:])), event.Pid,
-		trimNull(string(event.Pname[:])))
+	// Format interface info
+	ifInfo := fmt.Sprintf("%d(%s)", event.Ifindex, trimNull(string(event.Ifname[:])))
 
-	// Format IP addresses based on protocol
+	// Format process info
+	procInfo := fmt.Sprintf("%d(%s)", event.Pid, trimNull(string(event.Pname[:])))
+
+	// Format connection info based on protocol
+	var connInfo string
 	if event.L3Proto == syscall.ETH_P_IP {
-		fmt.Fprintf(writer, "%s:%d > %s:%d ",
+		connInfo = fmt.Sprintf("%s:%d > %s:%d",
 			net.IP(event.Saddr[:4]).String(), ntohs(event.Sport),
 			net.IP(event.Daddr[:4]).String(), ntohs(event.Dport))
 	} else {
-		fmt.Fprintf(writer, "[%s]:%d > [%s]:%d ",
+		connInfo = fmt.Sprintf("[%s]:%d > [%s]:%d",
 			net.IP(event.Saddr[:]).String(), ntohs(event.Sport),
 			net.IP(event.Daddr[:]).String(), ntohs(event.Dport))
 	}
 
 	// Format TCP flags if applicable
+	tcpFlagsStr := ""
 	if event.L4Proto == syscall.IPPROTO_TCP {
-		fmt.Fprintf(writer, "tcp_flags=%s ", tcpFlags(event.TcpFlags))
+		tcpFlagsStr = tcpFlags(event.TcpFlags)
 	}
 
-	fmt.Fprintf(writer, "payload_len=%d %s\n", event.PayloadLen, sym.Name)
+	// Format and print the event with column alignment
+	fmt.Fprintf(writer, "%-16x %-10x %-12d %-20s %-18s %-45s %-10s %-7d %s\n",
+		event.Skb,        // SKB address - 16 chars for 64-bit hex
+		event.Mark,       // Mark - 10 chars for 32-bit hex
+		event.Netns,      // Network namespace - 12 chars for up to 10-digit number
+		ifInfo,           // Interface info - 20 chars for index and name
+		procInfo,         // Process info - 18 chars for pid and name
+		connInfo,         // Connection info - 45 chars for source and destination
+		tcpFlagsStr,      // TCP flags - 10 chars
+		event.PayloadLen, // Payload length - 7 chars
+		sym.Name,         // Function name - variable length
+	)
 }
 
 func searchAvailableTargets() (map[int][]string, []string, error) {
