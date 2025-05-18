@@ -142,6 +142,9 @@ static __always_inline int set_pinfo(const u64 cookie)
 		}
 	}
 
+	if (!!bpf_strncmp((char *)&pinfo.pname, CONFIG.plen, (char *)&CONFIG.pname))
+		return 0;
+
 	bpf_map_update_elem(&cookie_pinfo_map, &cookie, &pinfo, BPF_ANY);
 	return 0;
 }
@@ -274,7 +277,7 @@ handle_skb(struct sk_buff *skb, struct pt_regs *ctx)
 		return 0;
 
 	struct pinfo *pinfo = bpf_map_lookup_elem(&cookie_pinfo_map, &cookie);
-	if (!pinfo || !!bpf_strncmp((char *)&pinfo->pname, CONFIG.plen, (char *)&CONFIG.pname))
+	if (!pinfo)
 		return 0;
 
 	bpf_map_update_elem(&skb_from_process, &skb, &TRUE, BPF_ANY);
