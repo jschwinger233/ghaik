@@ -24,6 +24,7 @@ import (
 	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"github.com/fatih/color"
 	"github.com/jschwinger233/ghaik/bpf"
 )
 
@@ -78,7 +79,24 @@ var (
 	kallsyms       []Symbol
 	kallsymsByName = make(map[string]Symbol)
 	kallsymsByAddr = make(map[uint64]Symbol)
+	skbColors      = make(map[uint64]*color.Color)
+	colorIndex     = 0
 )
+
+var availableColors = []*color.Color{
+	color.New(color.FgRed),
+	color.New(color.FgGreen),
+	color.New(color.FgYellow),
+	color.New(color.FgBlue),
+	color.New(color.FgMagenta),
+	color.New(color.FgCyan),
+	color.New(color.FgHiRed),
+	color.New(color.FgHiGreen),
+	color.New(color.FgHiYellow),
+	color.New(color.FgHiBlue),
+	color.New(color.FgHiMagenta),
+	color.New(color.FgHiCyan),
+}
 
 func main() {
 	var filterProcessName string
@@ -178,8 +196,8 @@ func printColumnHeaders() {
 	fmt.Printf("%-16s %-8s %-10s %-15s %-40s %-6s %-6s %-6s %s\n",
 		"SKB", "MARK", "NETNS", "INTERFACE", "CONNECTION", "FLAGS", "LEN", "LINEAR", "FUNCTION")
 	fmt.Printf("%-16s %-8s %-10s %-15s %-40s %-6s %-6s %-6s %s\n",
-		strings.Repeat("-", 16), strings.Repeat("-", 8), strings.Repeat("-", 10), 
-		strings.Repeat("-", 15), strings.Repeat("-", 40), strings.Repeat("-", 6), 
+		strings.Repeat("-", 16), strings.Repeat("-", 8), strings.Repeat("-", 10),
+		strings.Repeat("-", 15), strings.Repeat("-", 40), strings.Repeat("-", 6),
 		strings.Repeat("-", 6), strings.Repeat("-", 6), strings.Repeat("-", 10))
 }
 
@@ -344,8 +362,11 @@ func formatEvent(writer *os.File, event bpfEvent) {
 		flagsField = fmt.Sprintf("%-6s", "")
 	}
 
-	fmt.Fprintf(writer, "%-16x %-8x %-10d %-15s %-40s %s %-6d %-6d %s\n",
-		event.Skb,
+	skbColor := getColorForSKB(event.Skb)
+	skbStr := skbColor.Sprintf("%-16x", event.Skb)
+
+	fmt.Fprintf(writer, "%s %-8x %-10d %-15s %-40s %s %-6d %-6d %s\n",
+		skbStr,
 		event.Mark,
 		event.Netns,
 		ifInfo,
@@ -559,4 +580,16 @@ func tcpFlags(data uint8) string {
 
 	sort.Strings(flags)
 	return strings.Join(flags, "")
+}
+
+func getColorForSKB(skbAddr uint64) *color.Color {
+	if col, exists := skbColors[skbAddr]; exists {
+		return col
+	}
+
+	col := availableColors[colorIndex]
+	skbColors[skbAddr] = col
+
+	colorIndex = (colorIndex + 1) % len(availableColors)
+	return col
 }
