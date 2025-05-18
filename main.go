@@ -44,21 +44,22 @@ func init() {
 }
 
 type bpfEvent struct {
-	Pc          uint64
-	Skb         uint64
-	SecondParam uint64
-	Mark        uint32
-	Netns       uint32
-	Ifindex     uint32
-	Ifname      [16]uint8
-	Saddr       [16]byte
-	Daddr       [16]byte
-	Sport       uint16
-	Dport       uint16
-	L3Proto     uint16
-	L4Proto     uint8
-	TcpFlags    uint8
-	PayloadLen  uint16
+	Pc           uint64
+	Skb          uint64
+	SecondParam  uint64
+	Mark         uint32
+	Netns        uint32
+	Ifindex      uint32
+	Ifname       [16]uint8
+	Saddr        [16]byte
+	Daddr        [16]byte
+	Sport        uint16
+	Dport        uint16
+	L3Proto      uint16
+	L4Proto      uint8
+	TcpFlags     uint8
+	SkbLen       uint32
+	SkbLinearLen uint32
 }
 
 type Symbol struct {
@@ -68,8 +69,6 @@ type Symbol struct {
 	Kmod string
 }
 
-// Types that match the constants in the BPF program
-// This matches the 'struct config' in the BPF program
 type BpfConfig struct {
 	Pname [16]byte
 	Plen  uint32
@@ -102,7 +101,6 @@ func run(processName string) error {
 		return fmt.Errorf("failed to load BPF: %w", err)
 	}
 
-	// Pass the process filter to the BPF program if provided
 	if processName != "" {
 		for varName, varSpec := range spec.Variables {
 			println("Variable name:", varName, "Variable spec:", varSpec)
@@ -112,20 +110,15 @@ func run(processName string) error {
 			return fmt.Errorf("'CONFIG' variable not found in BPF program")
 		}
 
-		// Create and populate the configuration structure
 		config := BpfConfig{}
-
-		// Copy process name to the Pname field, ensuring we don't exceed the array size
 		copy(config.Pname[:], processName)
 
-		// Set the length of the process name
 		nameLen := len(processName)
 		if nameLen > len(config.Pname) {
 			nameLen = len(config.Pname)
 		}
 		config.Plen = uint32(nameLen)
 
-		// Set the variable in the BPF program
 		if err := configVar.Set(config); err != nil {
 			return fmt.Errorf("failed to set process filter: %w", err)
 		}
@@ -147,11 +140,9 @@ func run(processName string) error {
 		return fmt.Errorf("failed to detect cgroup path: %w", err)
 	}
 
-	// Attach cgroup programs
 	links := attachCgroupPrograms(cgroupPath, objs)
 	defer closeLinks(links)
 
-	// Attach kprobes
 	kprobeLinks, err := attachKprobes(objs)
 	if err != nil {
 		return fmt.Errorf("failed to attach kprobes: %w", err)
@@ -160,10 +151,8 @@ func run(processName string) error {
 
 	fmt.Println("Tracing started...")
 
-	// Print header row for formatted output
 	printColumnHeaders()
 
-	// Set up signal handling and ringbuffer reader
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -186,9 +175,12 @@ func run(processName string) error {
 }
 
 func printColumnHeaders() {
-	fmt.Printf("%-16s %-10s %-12s %-20s %-45s %-10s %-7s %s\n",
-		"SKB", "MARK", "NETNS", "INTERFACE", "CONNECTION", "FLAGS", "LENGTH", "FUNCTION")
-	fmt.Printf("%s\n", strings.Repeat("-", 150)) // Separator line
+	fmt.Printf("%-16s %-8s %-10s %-15s %-40s %-6s %-6s %-6s %s\n",
+		"SKB", "MARK", "NETNS", "INTERFACE", "CONNECTION", "FLAGS", "LEN", "LINEAR", "FUNCTION")
+	fmt.Printf("%-16s %-8s %-10s %-15s %-40s %-6s %-6s %-6s %s\n",
+		strings.Repeat("-", 16), strings.Repeat("-", 8), strings.Repeat("-", 10), 
+		strings.Repeat("-", 15), strings.Repeat("-", 40), strings.Repeat("-", 6), 
+		strings.Repeat("-", 6), strings.Repeat("-", 6), strings.Repeat("-", 10))
 }
 
 func detectCgroupPath() (string, error) {
@@ -238,20 +230,17 @@ func attachCgroupPrograms(cgroupPath string, objs bpf.BpfObjects) []link.Link {
 func attachKprobes(objs bpf.BpfObjects) ([]link.Link, error) {
 	var links []link.Link
 
-	// Attach kprobe for kfree_skbmem
 	k, err := link.Kprobe("kfree_skbmem", objs.KprobeFreeSkb, nil)
 	if err != nil {
 		return links, fmt.Errorf("failed to attach kfree_skbmem: %w", err)
 	}
 	links = append(links, k)
 
-	// Find and attach other kprobes
 	targets, allocSkbFuncs, err := searchAvailableTargets()
 	if err != nil {
 		return links, fmt.Errorf("failed to find targets: %w", err)
 	}
 
-	// Attach kretprobe to all addresses
 	allKaddrs := getAllAddresses(targets)
 	krmulti, err := link.KretprobeMulti(objs.KretprobeSkb, link.KprobeMultiOptions{Addresses: allKaddrs})
 	if err != nil {
@@ -259,7 +248,6 @@ func attachKprobes(objs bpf.BpfObjects) ([]link.Link, error) {
 	}
 	links = append(links, krmulti)
 
-	// Attach kprobes for different targets
 	kprobePrograms := map[*ebpf.Program][]string{
 		objs.KprobeSkb1: targets[0],
 		objs.KprobeSkb2: targets[1],
@@ -285,7 +273,6 @@ func attachKprobes(objs bpf.BpfObjects) ([]link.Link, error) {
 		links = append(links, kmulti)
 	}
 
-	// Attach kretprobe for alloc_skb functions
 	if len(allocSkbFuncs) > 0 {
 		krs, err := link.KretprobeMulti(objs.KretprobeAllocSkb, link.KprobeMultiOptions{Symbols: allocSkbFuncs})
 		if err != nil {
@@ -316,10 +303,8 @@ func processEvents(eventsReader *ringbuf.Reader) error {
 		rec, err := eventsReader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				// This is expected on graceful shutdown
 				return nil
 			}
-			// Just log the error and continue processing other events
 			log.Printf("Failed to read ringbuf: %v", err)
 			continue
 		}
@@ -337,10 +322,8 @@ func processEvents(eventsReader *ringbuf.Reader) error {
 func formatEvent(writer *os.File, event bpfEvent) {
 	sym := nearestSymbol(event.Pc)
 
-	// Format interface info
 	ifInfo := fmt.Sprintf("%d(%s)", event.Ifindex, trimNull(string(event.Ifname[:])))
 
-	// Format connection info based on protocol
 	var connInfo string
 	if event.L3Proto == syscall.ETH_P_IP {
 		connInfo = fmt.Sprintf("%s:%d > %s:%d",
@@ -352,22 +335,25 @@ func formatEvent(writer *os.File, event bpfEvent) {
 			net.IP(event.Daddr[:]).String(), ntohs(event.Dport))
 	}
 
-	// Format TCP flags if applicable
 	tcpFlagsStr := ""
+	flagsField := ""
 	if event.L4Proto == syscall.IPPROTO_TCP {
 		tcpFlagsStr = tcpFlags(event.TcpFlags)
+		flagsField = fmt.Sprintf("%-6s", tcpFlagsStr)
+	} else {
+		flagsField = fmt.Sprintf("%-6s", "")
 	}
 
-	// Format and print the event with column alignment
-	fmt.Fprintf(writer, "%-16x %-10x %-12d %-20s %-45s %-10s %-7d %s\n",
-		event.Skb,        // SKB address - 16 chars for 64-bit hex
-		event.Mark,       // Mark - 10 chars for 32-bit hex
-		event.Netns,      // Network namespace - 12 chars for up to 10-digit number
-		ifInfo,           // Interface info - 20 chars for index and name
-		connInfo,         // Connection info - 45 chars for source and destination
-		tcpFlagsStr,      // TCP flags - 10 chars
-		event.PayloadLen, // Payload length - 7 chars
-		sym.Name,         // Function name - variable length
+	fmt.Fprintf(writer, "%-16x %-8x %-10d %-15s %-40s %s %-6d %-6d %s\n",
+		event.Skb,
+		event.Mark,
+		event.Netns,
+		ifInfo,
+		connInfo,
+		flagsField,
+		event.SkbLen,
+		event.SkbLinearLen,
+		sym.Name,
 	)
 }
 
@@ -375,18 +361,15 @@ func searchAvailableTargets() (map[int][]string, []string, error) {
 	targets := make(map[int][]string)
 	var allocSkbFuncs []string
 
-	// Load kernel BTF spec
 	btfSpec, err := btf.LoadKernelSpec()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load kernel BTF: %w", err)
 	}
 
-	// Create a map of iterators for kernel modules
 	iters := map[string]*btf.TypesIterator{
 		"": btfSpec.Iterate(),
 	}
 
-	// Add iterators for kernel modules
 	files, err := os.ReadDir("/sys/kernel/btf")
 	if err == nil {
 		for _, file := range files {
@@ -408,15 +391,12 @@ func searchAvailableTargets() (map[int][]string, []string, error) {
 		}
 	}
 
-	// Get available filter functions
 	availableFuncs, _ := getAvailableFilterFunctions()
 
-	// Load kallsyms
 	if err := readKallsyms(); err != nil {
 		return nil, nil, fmt.Errorf("failed to read kallsyms: %w", err)
 	}
 
-	// Find functions with sk_buff parameters or return values
 	for kmod, iter := range iters {
 		for iter.Next() {
 			typ := iter.Type
@@ -430,7 +410,6 @@ func searchAvailableTargets() (map[int][]string, []string, error) {
 				name = fmt.Sprintf("%s [%s]", fn.Name, kmod)
 			}
 
-			// Skip functions that aren't available for tracing
 			if _, ok := availableFuncs[name]; !ok {
 				continue
 			}
@@ -440,7 +419,6 @@ func searchAvailableTargets() (map[int][]string, []string, error) {
 
 			fnProto := fn.Type.(*btf.FuncProto)
 
-			// Check function parameters for sk_buff
 			for i, p := range fnProto.Params {
 				if ptr, ok := p.Type.(*btf.Pointer); ok {
 					if strct, ok := ptr.Target.(*btf.Struct); ok {
@@ -452,7 +430,6 @@ func searchAvailableTargets() (map[int][]string, []string, error) {
 				}
 			}
 
-			// Check return value for sk_buff
 			if ptr, ok := fnProto.Return.(*btf.Pointer); ok {
 				if strct, ok := ptr.Target.(*btf.Struct); ok {
 					if strct.Name == "sk_buff" {

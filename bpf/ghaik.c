@@ -79,7 +79,8 @@ struct tuple {
 	u16 l3_proto;
 	u8 l4_proto;
 	u8 tcp_flags;
-	u16 payload_len;
+	u32 skb_len;
+	u32 skb_linear_len;
 } __attribute__((packed));
 
 struct event {
@@ -228,39 +229,39 @@ set_tuple(struct tuple *tpl, struct sk_buff *skb)
 	struct iphdr *l3_hdr = (struct iphdr *) (skb_head + l3_off);
 	u8 ip_vsn = BPF_CORE_READ_BITFIELD_PROBED(l3_hdr, version);
 
-	u16 l3_total_len;
 	if (ip_vsn == 4) {
 		struct iphdr *ip4 = (struct iphdr *) l3_hdr;
 		BPF_CORE_READ_INTO(&tpl->saddr, ip4, saddr);
 		BPF_CORE_READ_INTO(&tpl->daddr, ip4, daddr);
 		tpl->l4_proto = BPF_CORE_READ(ip4, protocol);
 		tpl->l3_proto = ETH_P_IP;
-		l3_total_len = bpf_ntohs(BPF_CORE_READ(ip4, tot_len));
 	} else if (ip_vsn == 6) {
 		struct ipv6hdr *ip6 = (struct ipv6hdr *) l3_hdr;
 		BPF_CORE_READ_INTO(&tpl->saddr, ip6, saddr);
 		BPF_CORE_READ_INTO(&tpl->daddr, ip6, daddr);
 		tpl->l4_proto = BPF_CORE_READ(ip6, nexthdr);
 		tpl->l3_proto = ETH_P_IPV6;
-		l3_total_len = bpf_ntohs(BPF_CORE_READ(ip6, payload_len));
 	}
-	u16 l3_hdr_len = l4_off - l3_off;
 
-	u16 l4_hdr_len;
 	if (tpl->l4_proto == IPPROTO_TCP) {
 		struct tcphdr *tcp = (struct tcphdr *) (skb_head + l4_off);
 		tpl->sport= BPF_CORE_READ(tcp, source);
 		tpl->dport= BPF_CORE_READ(tcp, dest);
 		bpf_probe_read_kernel(&tpl->tcp_flags, sizeof(tpl->tcp_flags),
 				    (void *)tcp + offsetof(struct tcphdr, ack_seq) + 5);
-		l4_hdr_len = BPF_CORE_READ_BITFIELD_PROBED(tcp, doff) * 4;
-		tpl->payload_len = l3_total_len - l3_hdr_len - l4_hdr_len;
 	} else if (tpl->l4_proto == IPPROTO_UDP) {
 		struct udphdr *udp = (struct udphdr *) (skb_head + l4_off);
 		tpl->sport= BPF_CORE_READ(udp, source);
 		tpl->dport= BPF_CORE_READ(udp, dest);
-		tpl->payload_len = bpf_ntohs(BPF_CORE_READ(udp, len)) - sizeof(struct udphdr);
 	}
+
+	tpl->skb_len = BPF_CORE_READ(skb, len);
+
+	u32 data_end = BPF_CORE_READ(skb, tail);
+	u32 data = !BPF_CORE_READ(skb, mac_len)
+		? BPF_CORE_READ(skb, network_header)
+		: BPF_CORE_READ(skb, mac_header);
+	tpl->skb_linear_len = data_end - data;
 }
 
 static __always_inline int

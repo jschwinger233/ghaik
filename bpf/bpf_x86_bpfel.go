@@ -36,12 +36,13 @@ type BpfEvent struct {
 			V4addr uint32
 			_      [12]byte
 		}
-		Sport      uint16
-		Dport      uint16
-		L3Proto    uint16
-		L4Proto    uint8
-		TcpFlags   uint8
-		PayloadLen uint16
+		Sport        uint16
+		Dport        uint16
+		L3Proto      uint16
+		L4Proto      uint8
+		TcpFlags     uint8
+		SkbLen       uint32
+		SkbLinearLen uint32
 	}
 }
 
